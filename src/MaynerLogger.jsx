@@ -34,23 +34,86 @@ const addDays = (iso, n) => { const d = new Date(iso + "T00:00:00"); d.setDate(d
 const fmt = (iso) => { if (!iso) return "—"; const d = new Date(iso + "T00:00:00"); return d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }); };
 const fmtShort = (iso) => { if (!iso) return "—"; const d = new Date(iso + "T00:00:00"); return d.toLocaleDateString("en-US", { month: "short", day: "numeric" }); };
 
-const SEED = [
-  { id: 1, name: "Ian Perry", first: "Ian", email: "ian@example.com", cadence: "Weekly", lastSession: addDays(todayISO(), -3), followUpDays: 3, notes: "Worked on delegation. Still approving every quote over $500 himself — bottlenecking his lead tech. Committed to letting the tech approve up to $1,500 this week.", status: "Pending" },
-  { id: 2, name: "Jordan Jeffers", first: "Jordan", email: "jordan@example.com", cadence: "Biweekly", lastSession: addDays(todayISO(), -5), followUpDays: 5, notes: "Role clarity conversation. Two team leads giving conflicting priorities. Drafting POAs for each before next session.", status: "Pending" },
-  { id: 3, name: "Matt Schrader", first: "Matt", email: "matt@example.com", cadence: "Weekly", lastSession: addDays(todayISO(), -7), followUpDays: 5, notes: "Reacting under pressure in team meetings. Talked through Detach — reading the room before responding. Wants one rep this week.", status: "Sent" },
-  { id: 4, name: "Dana Cole", first: "Dana", email: "dana@example.com", cadence: "Monthly", lastSession: addDays(todayISO(), -20), followUpDays: 25, notes: "Building a scoreboard for the sales team. Momentum is good. Next: weekly rhythm of check-ins.", status: "Pending" },
-];
-
 const CADENCES = ["Weekly", "Biweekly", "Monthly"];
 
 // ─────────────────────────────────────────────────────────────
-// LIVE CONNECTION to the Make.com webhook.
-// This webhook writes to the Google Sheet (routes on `mode`: add | log).
+// LIVE READ from the Google Sheet (published to web as CSV).
+// The app fetches this on load to show the real client list.
+// Note: Google caches this, so edits can take 1–2 min to appear on reload.
+const SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRsAbFI3A6n5fSu0Uw3kPsLV4e7-b90_SI-6lOEDJHP9b7U5X8Zrv7ulfQZbYvyVobohljjBS6DFTPa/pub?gid=0&single=true&output=csv";
+
+// Minimal CSV parser that handles quoted fields, commas, and newlines inside quotes.
+function parseCSV(text) {
+  const rows = [];
+  let row = [], field = "", inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i], next = text[i + 1];
+    if (inQuotes) {
+      if (ch === '"' && next === '"') { field += '"'; i++; }
+      else if (ch === '"') { inQuotes = false; }
+      else { field += ch; }
+    } else {
+      if (ch === '"') { inQuotes = true; }
+      else if (ch === ",") { row.push(field); field = ""; }
+      else if (ch === "\r") { /* skip */ }
+      else if (ch === "\n") { row.push(field); rows.push(row); row = []; field = ""; }
+      else { field += ch; }
+    }
+  }
+  if (field.length > 0 || row.length > 0) { row.push(field); rows.push(row); }
+  return rows;
+}
+
+// Turn the sheet's rows into the client objects the app renders.
+// Maps by header NAME so column order can shift without breaking.
+function rowsToClients(rows) {
+  if (!rows.length) return [];
+  const headers = rows[0].map((h) => h.trim().toLowerCase());
+  const idx = (name) => headers.indexOf(name.toLowerCase());
+  const iName = idx("Client Name");
+  const iFirst = idx("Client First Name");
+  const iEmail = idx("Email");
+  const iCadence = idx("Meeting cadence");
+  const iLast = idx("Last Session Date");
+  const iDays = idx("Follow-Up Days");
+  const iNotes = idx("Session Notes");
+  const iStatus = idx("Status");
+  const out = [];
+  for (let r = 1; r < rows.length; r++) {
+    const row = rows[r];
+    const name = (iName >= 0 ? row[iName] : "").trim();
+    const email = (iEmail >= 0 ? row[iEmail] : "").trim();
+    if (!name && !email) continue; // skip blank rows
+    out.push({
+      id: `sheet-${r}`,
+      name,
+      first: (iFirst >= 0 ? row[iFirst] : "").trim() || name.split(" ")[0],
+      email,
+      cadence: (iCadence >= 0 ? row[iCadence] : "").trim() || "Weekly",
+      lastSession: (iLast >= 0 ? row[iLast] : "").trim(),
+      followUpDays: Number((iDays >= 0 ? row[iDays] : "").trim()) || 0,
+      notes: (iNotes >= 0 ? row[iNotes] : "").trim(),
+      status: (iStatus >= 0 ? row[iStatus] : "").trim() || "Pending",
+    });
+  }
+  return out;
+}
+
+// Normalize date-ish strings from the sheet (e.g. "6/25/2026") to YYYY-MM-DD
+// so the app's date helpers work. Leaves already-ISO or empty values alone.
+function normalizeDate(s) {
+  if (!s) return "";
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  const d = new Date(s);
+  if (isNaN(d)) return "";
+  return d.toISOString().slice(0, 10);
+}
+
+// ─────────────────────────────────────────────────────────────
+// LIVE WRITE to the Make.com webhook (routes on `mode`: add | log).
 // To rotate it, replace this URL and redeploy.
 const WEBHOOK_URL = "https://hook.us2.make.com/8wljybj1at4q9s9bckhx6x5979ywt2wy";
 
-// Sends one payload to Make. Returns true on success.
-// Uses URL-encoded params (matches how the webhook was set up/tested).
 async function sendToSheet(payload) {
   try {
     const body = new URLSearchParams(payload).toString();
@@ -80,13 +143,38 @@ function StatusDot({ status }) {
 }
 
 export default function MaynerLogger() {
-  const [clients, setClients] = useState(SEED);
+  const [clients, setClients] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState(false);
   const [query, setQuery] = useState("");
   const [panel, setPanel] = useState(null); // {mode:'log'|'add'|'edit', id?}
   const [form, setForm] = useState(emptyClient);
   const [toast, setToast] = useState("");
 
   const flash = (m) => { setToast(m); setTimeout(() => setToast(""), 2600); };
+
+  // Load the real client list from the published sheet on mount.
+  const loadClients = React.useCallback(async () => {
+    setLoading(true);
+    setLoadError(false);
+    try {
+      // cache-bust so a manual refresh pulls the freshest published copy
+      const res = await fetch(`${SHEET_CSV_URL}&t=${Date.now()}`);
+      if (!res.ok) throw new Error("fetch failed");
+      const text = await res.text();
+      const parsed = rowsToClients(parseCSV(text)).map((c) => ({
+        ...c,
+        lastSession: normalizeDate(c.lastSession),
+      }));
+      setClients(parsed);
+    } catch (e) {
+      setLoadError(true);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  React.useEffect(() => { loadClients(); }, [loadClients]);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -120,7 +208,7 @@ export default function MaynerLogger() {
   };
 
   const saveAdd = async () => {
-    const id = Math.max(0, ...clients.map((c) => c.id)) + 1;
+    const id = `new-${Date.now()}`;
     const hasSession = form.notes.trim().length > 0;
     const first = form.first || form.name.split(" ")[0];
     setClients((prev) => [...prev, {
@@ -178,7 +266,10 @@ export default function MaynerLogger() {
               <div style={{ fontSize: 12.5, opacity: .85, marginTop: 3, letterSpacing: .3 }}>Client Sessions &amp; Notes</div>
             </div>
           </div>
-          <button className="btn" onClick={openAdd} style={{ background: BRAND.white, color: BRAND.red, padding: "11px 18px", borderRadius: 9, fontSize: 14 }}>+ Add client</button>
+          <div style={{ display: "flex", gap: 10 }}>
+            <button className="btn" onClick={loadClients} title="Reload from the sheet" style={{ background: "rgba(255,255,255,0.15)", color: BRAND.white, padding: "11px 16px", borderRadius: 9, fontSize: 14, border: "1px solid rgba(255,255,255,0.35)" }}>↻ Refresh</button>
+            <button className="btn" onClick={openAdd} style={{ background: BRAND.white, color: BRAND.red, padding: "11px 18px", borderRadius: 9, fontSize: 14 }}>+ Add client</button>
+          </div>
         </div>
       </header>
 
@@ -192,6 +283,24 @@ export default function MaynerLogger() {
           What you last covered, and when you last met. Log a session and the follow-up sends itself.
         </p>
 
+        {loading && (
+          <div style={{ textAlign: "center", padding: "56px 20px", color: BRAND.slate }}>
+            <div className="display" style={{ fontSize: 18, color: BRAND.ink }}>Loading clients…</div>
+            <p style={{ fontSize: 14, marginTop: 6 }}>Pulling the latest from your sheet.</p>
+          </div>
+        )}
+
+        {loadError && !loading && (
+          <div style={{ background: BRAND.white, border: `1px solid ${BRAND.line}`, borderLeft: `4px solid ${BRAND.red}`, borderRadius: 14, padding: "28px 24px", marginTop: 22 }}>
+            <div className="display" style={{ fontSize: 18, color: BRAND.ink }}>Couldn't load the client list.</div>
+            <p style={{ color: BRAND.slate, marginTop: 8, fontSize: 14, lineHeight: 1.55 }}>
+              The app couldn't reach the published sheet. This is usually temporary. Click Refresh to try again. If it keeps happening, confirm the sheet is still published to the web (File → Share → Publish to web).
+            </p>
+            <button className="btn" onClick={loadClients} style={{ marginTop: 12, background: BRAND.red, color: BRAND.white, padding: "10px 16px", borderRadius: 9, fontSize: 14 }}>↻ Try again</button>
+          </div>
+        )}
+
+        {!loading && !loadError && (
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(320px, 1fr))", gap: 14, marginTop: 22 }}>
           {filtered.map((c) => (
             <div key={c.id} className="card" style={{ background: BRAND.white, border: `1px solid ${BRAND.line}`, borderRadius: 14, padding: "18px 18px 16px", display: "flex", flexDirection: "column" }}>
@@ -226,9 +335,20 @@ export default function MaynerLogger() {
 
         {filtered.length === 0 && (
           <div style={{ background: BRAND.white, border: `1px solid ${BRAND.line}`, borderRadius: 14, padding: "44px 24px", textAlign: "center", marginTop: 22 }}>
-            <div className="display" style={{ fontSize: 19 }}>No clients match “{query}”.</div>
-            <p style={{ color: BRAND.slate, marginTop: 8, fontSize: 14 }}>Clear the search, or add a new client.</p>
+            {query ? (
+              <>
+                <div className="display" style={{ fontSize: 19 }}>No clients match “{query}”.</div>
+                <p style={{ color: BRAND.slate, marginTop: 8, fontSize: 14 }}>Clear the search, or add a new client.</p>
+              </>
+            ) : (
+              <>
+                <div className="display" style={{ fontSize: 19 }}>No clients yet.</div>
+                <p style={{ color: BRAND.slate, marginTop: 8, fontSize: 14 }}>Add your first client to get started. They'll show up here and in your sheet.</p>
+              </>
+            )}
           </div>
+        )}
+        </div>
         )}
       </main>
 
